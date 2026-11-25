@@ -40,6 +40,20 @@ start() {
         return 1
     }
 
+    # 启动播放器。
+    #
+    # 【必须用 start-stop-daemon -b，不能改成 setsid ... & 或 nohup】
+    # 试过改成 `setsid "$BIN" ... &` 想让日志落到文件，结果这块板子的
+    # busybox 根本没有 setsid，退化到普通后台运行 —— 脚本一退出，
+    # 子进程立刻收到 SIGHUP 被杀掉。现象是：start 当场能看到进程、
+    # 几秒后就没了，日志停在初始化阶段（连"开始播放"都没打印）。
+    #
+    # start-stop-daemon -b 自己会做 daemon 化（setsid + 关闭继承的 fd），
+    # 进程能活下来。代价是它把 stdout/stderr 全部指向 /dev/null。
+    #
+    # 日志问题的正解：让播放器自己写日志文件（见 player.c 的
+    # log_file_init()，把 stdout 重定向到 /tmp/player.log），
+    # 而不是依赖 shell 的重定向。这样 -b 丢不丢输出都无所谓。
     start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- "$MEDIA" --loop
 
     sleep 2

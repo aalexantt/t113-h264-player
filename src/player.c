@@ -726,6 +726,36 @@ int main(int argc, char **argv)
      * 这样解码器和 disp 层能正常清理。 */
     install_signal_handlers();
 
+    /* 把 stdout/stderr 重定向到日志文件。
+     *
+     * 【为什么要在程序里做】
+     * 开机自启走的是 `start-stop-daemon -b`，它 daemon 化时会把子进程的
+     * stdout/stderr 全部指向 /dev/null，于是脚本层的重定向（>file）也失效，
+     * /tmp/player.log 永远是空的 —— 出问题时拿不到任何现场信息。
+     *
+     * 试过改用 `setsid ... &` 来保留重定向，但这块板子的 busybox 没有
+     * setsid，退化到普通后台运行后子进程会被 SIGHUP 杀掉
+     * （现象：启动几秒后进程消失，日志停在初始化阶段）。
+     *
+     * 所以正解是程序自己打开日志文件并 dup2 到 1/2，
+     * 这样不管外面怎么启动都能留下记录。
+     *
+     * 用 O_TRUNC 覆盖：每次启动只保留本次记录，避免 /tmp（tmpfs）堆积。
+     * 打开失败就继续用原来的 stdout，不影响播放。 */
+    {
+        const char *logpath = "/tmp/player.log";
+        int lfd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (lfd >= 0) {
+            dup2(lfd, STDOUT_FILENO);
+            dup2(lfd, STDERR_FILENO);
+            if (lfd > STDERR_FILENO)
+                close(lfd);
+            /* 变成行缓冲：不这样的话重定向到文件时是全缓冲，
+             * 进程被 kill 时最后一批日志会丢，排查时最需要的那几行正好没了。 */
+            setvbuf(stdout, NULL, _IOLBF, 0);
+        }
+    }
+
     memset(&c, 0, sizeof(c));
     c.disp_fd = -1;
     pthread_mutex_init(&c.lock, NULL);
