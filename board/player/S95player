@@ -17,7 +17,7 @@ BIN=/opt/player
 # 带音轨的 1280x720.mp4 也能用，但播放器目前还没接 AAC 解码，
 # 用带音轨的文件只是多解析一个用不上的 trak，不如直接用 noaudio 版省事。
 # 想换文件改这一行即可。
-MEDIA=${MEDIA:-/opt/media/1280x720.noaudio.mp4}
+MEDIA=${MEDIA:-/opt/media/1080p.mp4}
 PIDFILE=/var/run/player.pid
 LOGFILE=/tmp/player.log
 
