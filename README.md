@@ -290,3 +290,10 @@ mem 75/108M free 9M    可用内存 / 总量 / 账面空闲
 **不包含** Allwinner 的预编译库（`libvdecoder.so` 等）和 SDK 源码——
 这些是厂商版权物，需自行从设备和 SDK 获取。`make pull-libs` 从设备上拉取，
 `lib/` 已加入 `.gitignore`。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/排查记录.md`](docs/排查记录.md) | 完整排查过程：每个坑的现象、证据、结论 |
+| [`docs/git-setup.md`](docs/git-setup.md) | Git 推送配置：SSH key、凭据文件、代理处理 |
