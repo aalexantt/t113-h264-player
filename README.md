@@ -108,6 +108,15 @@ adb shell "cd /opt && ./player /opt/media/test.mp4 60"
 
 第二个参数是播放秒数（默认 30）。播完自动退出，期间循环播放。
 
+**无限循环**（开机自启、长时间展示用）：
+
+```bash
+./player /opt/media/test.mp4 --loop    # 一直播，Ctrl-C 或 kill 退出
+./player /opt/media/test.mp4 0         # 同上
+```
+
+`--loop` 模式下进程常驻，收到 `SIGTERM` / `SIGINT` 会清理 disp 层后正常退出。
+
 ## 关键结论
 
 这部分是踩坑记录，每条都有实测依据。详版见 [`docs/排查记录.md`](docs/排查记录.md)。

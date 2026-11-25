@@ -356,3 +356,153 @@ shift 2
 
 **教训**：不要基于推理下结论，要实测。当时如果不做那个
 "`-b` 启动 8080 vs 80 对比"的实验，就会一直往错误方向改。
+
+## 十、开机自动循环播放视频
+
+### 10.1 播放器改造
+
+原来 `player` 的第二个参数是播放秒数，播完就退出，**做不到开机常驻**。
+
+加了两种写法：
+
+```bash
+/opt/player file.mp4 --loop    # 无限循环（开机自启用这个）
+/opt/player file.mp4 0         # 同上，0 也表示无限
+/opt/player file.mp4 10        # 播 10 秒退出（原行为不变）
+```
+
+参数解析改成遍历，`--loop` 和 `0` 都设 `forever=1`：
+
+```c
+for (ai = 2; ai < argc; ai++) {
+    if (strcmp(argv[ai], "--loop") == 0)      forever = 1;
+    else if (argv[ai][0] != '-') {
+        play_sec = atoi(argv[ai]);
+        if (play_sec <= 0)                    forever = 1;
+    }
+}
+```
+
+循环条件：
+
+```c
+while (!(get_state(&c) & ST_EXIT) && !g_sig_quit &&
+       (forever || now_us() - t0 < limit)) {
+```
+
+### 10.2 加信号处理（关键）
+
+开机启动的进程需要能被 `stop` 干净停止。原来没有信号处理，
+`kill` 之后进程直接死掉，**disp 层没清理**。
+
+```c
+static volatile sig_atomic_t g_sig_quit = 0;
+
+static void on_signal(int sig) { g_sig_quit = 1; }
+```
+
+**为什么不在信号处理函数里直接操作 ctx**：
+`pthread_mutex_lock` 不是 async-signal-safe 的。如果主线程正好持有该锁，
+在处理函数里加锁会死锁，而且是在中断上下文里死锁，没有任何日志，
+表现为进程卡死不退出。
+
+所以只置标志，由主循环自己检查后正常退出。
+
+### 10.3 退出时清理 disp 层（重要修复）
+
+原来退出只做了 `close(disp_fd)`，**没有关闭 disp 层**。
+
+disp 层是驱动侧状态，不会随进程退出自动释放。不关的后果：
+- 程序退出了，但画面定格在最后一帧
+- 下次启动时新旧两层叠加，画面花屏
+
+修复：退出前关掉自己占的两层。
+
+```c
+disp_layer_disable(c.disp_fd, DISP_CHANNEL, DISP_VIDEO_LYR);  // ch0/lyr0
+if (osd_ok)
+    disp_layer_disable(c.disp_fd, OSD_CHANNEL, OSD_LAYER);    // ch1/lyr1
+```
+
+**注意用的是 `DISP_LAYER_SET_CONFIG2` + `enable=0`，不是 `DISP_LAYER_DISABLE`。**
+
+驱动头里虽然有 `DISP_LAYER_DISABLE = 0x41`，但本驱动版本实际走
+SET_CONFIG2 这条路（`dispclean` 也是这么做的，实测有效）。用 0x41 不生效。
+
+**绝对不能动 `ch1/lyr0`** —— 那是系统 fbdev 层，关了直接黑屏。
+
+### 10.4 启动脚本 S95player
+
+`START=95` 排在 `S96wifi-auto` 之前 —— 播放不需要网络，早点起来能更快出画面。
+
+独立脚本而不是塞进 `S97gopanel`：两者互不相关，播放挂了不该影响 Web 面板。
+
+```sh
+MEDIA=${MEDIA:-/opt/media/1280x720.noaudio.mp4}
+OOM_ADJ=-300
+```
+
+- 默认播放**无音轨**版本。带音轨的也能用，但播放器还没接 AAC 解码，
+  用带音轨的文件只是多解析一个用不上的 trak
+- `OOM_ADJ=-300` 比 gopanel 的 -500 保守，因为 Web 面板可用性优先级更高
+
+启动前会先跑 `dispclean`，清掉上次可能残留的层（比如被 `kill -9` 时）。
+
+停止流程给了 3 秒优雅退出时间，超时才强杀：
+
+```sh
+kill -TERM $pid
+# 轮询最多 3 秒
+# 还不走就 kill -9，然后 dispclean 清理残留
+```
+
+### 10.5 实测结果
+
+```
+=== 模拟 rc.final 启动顺序 ===
+player: 9730     ✅
+gopanel: 9484    ✅
+watchdog: 有     ✅
+
+=== 播放状态 ===
+fps:60
+视频层: 1（NV12 层启用）
+
+=== Web 访问 ===
+http://linuxhost.local/ → HTTP 200
+```
+
+停止测试：
+
+```
+$ /etc/init.d/S95player stop
+进程: 已停
+disp 残留: 0  ✅
+```
+
+### 10.6 验证方法
+
+```bash
+# 启动
+/etc/init.d/S95player start
+pidof player                          # 应该有 PID
+cat /proc/$(pidof player)/cmdline     # 应含 --loop
+
+# 画面确认（两层都要在）
+cat /sys/class/disp/disp/attr/sys | grep 'enable ch['
+# 期望看到 ch[0] fmt[76] 是视频，ch[1] lyr[1] fmt[0] 是 OSD
+
+# 停止并确认无残留
+/etc/init.d/S95player stop
+cat /sys/class/disp/disp/attr/sys | grep -c 'enable ch\[0\]'   # 应为 0
+```
+
+### 10.7 换播放文件
+
+改脚本第 22 行的 `MEDIA` 默认值，或者临时用环境变量：
+
+```bash
+MEDIA=/opt/media/other.mp4 /etc/init.d/S95player restart
+```
+
+注意 `MEDIA` 必须是绝对路径，且文件存在，否则脚本会拒绝启动并记日志。

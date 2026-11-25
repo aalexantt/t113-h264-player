@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 
@@ -111,6 +112,34 @@ static int64_t now_us(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (int64_t)tv.tv_sec * 1000000ll + tv.tv_usec;
+}
+
+/* 信号处理只设一个 volatile 标志。
+ *
+ * 【为什么不在信号处理函数里直接操作 ctx】
+ * pthread_mutex_lock 不是 async-signal-safe 的。如果在处理函数里
+ * 加锁，而主线程正好持有该锁，就会死锁（而且是在中断上下文里死锁，
+ * 没有任何日志，表现为进程卡死不退出）。
+ * 所以这里只置标志，由主循环自己检查后正常退出。
+ */
+static volatile sig_atomic_t g_sig_quit = 0;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_sig_quit = 1;
+}
+
+static void install_signal_handlers(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;        /* 不用 SA_RESTART，让阻塞的调用被打断 */
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 }
 
 static int get_state(ctx_t *c)
@@ -540,6 +569,46 @@ static void *decoder_thread(void *arg)
     return NULL;
 }
 
+/* ---------- disp 层清理 ---------- */
+
+/* 关闭指定的 disp 层。
+ *
+ * 【为什么必须做】
+ * disp 层是驱动侧的状态，不会因为进程退出而自动释放。
+ * 如果播放器退出时不关，那层会一直留在屏幕上——
+ * 表现为：程序已经退出，但画面还定格在最后一帧；或者下次启动时
+ * 新旧两层叠加，画面变成花屏。
+ *
+ * 【为什么用 SET_CONFIG2 而不是 DISP_LAYER_DISABLE】
+ * 驱动头里虽然有 DISP_LAYER_DISABLE(0x41)，但本驱动版本实际走的是
+ * DISP_LAYER_SET_CONFIG2 + enable=0 这条路径（dispclean 也是这么做的，
+ * 实测有效）。0x41 那个 ioctl 在本版本上不生效。
+ *
+ * 注意：只关自己用到的层，别去动 ch1/lyr0（系统 fbdev 层），
+ * 那层关了会直接黑屏。 */
+static void disp_layer_disable(int fd, unsigned channel, unsigned layer)
+{
+    struct disp_layer_config2 cfg;
+    unsigned long arg[4];
+
+    if (fd < 0)
+        return;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.channel = (int)channel;
+    cfg.layer_id = (int)layer;
+    cfg.enable = 0;
+
+    memset(arg, 0, sizeof(arg));
+    arg[0] = DISP_SCREEN;
+    arg[1] = (unsigned long)&cfg;
+    arg[2] = 1;             /* 配置项个数 */
+
+    if (ioctl(fd, DISP_LAYER_SET_CONFIG2, (void *)arg) < 0)
+        fprintf(stderr, "[player] 关闭 ch%u/lyr%u 失败: %s\n",
+                channel, layer, strerror(errno));
+}
+
 /* ---------- main ---------- */
 
 int main(int argc, char **argv)
@@ -562,10 +631,21 @@ int main(int argc, char **argv)
     int osd_ok = 0;
 
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <file.mp4> [seconds]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <file.mp4> [seconds] [--loop]\n"
+                "  seconds  播放秒数，默认 30；写 0 表示一直播不退出\n"
+                "  --loop   等价于 seconds=0，语义更明确\n"
+                "示例:\n"
+                "  %s /opt/media/a.mp4 10     播 10 秒\n"
+                "  %s /opt/media/a.mp4 --loop 一直循环播放（开机自启用这个）\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
     path = argv[1];
+
+    /* 装信号处理：让 init 脚本 stop / Ctrl-C 能优雅退出，
+     * 这样解码器和 disp 层能正常清理。 */
+    install_signal_handlers();
 
     memset(&c, 0, sizeof(c));
     c.disp_fd = -1;
@@ -670,13 +750,38 @@ int main(int argc, char **argv)
     clock_start(&clk, c.mp4->media_timescale);
     t0 = now_us();
     {
-        int play_sec = (argc >= 3) ? atoi(argv[2]) : 30;
-        int64_t limit = (int64_t)play_sec * 1000000ll;
+        /* 播放时长解析：
+         *   --loop        无限循环（常驻模式，开机自启就用这个）
+         *   数字 > 0      播这么多秒后退出
+         *   0 / 负数      等同 --loop
+         * 不传时默认 30 秒（保留原来的行为，方便手动测试）。 */
+        int play_sec = 30;
+        int forever = 0;
+        int ai;
+
+        for (ai = 2; ai < argc; ai++) {
+            if (strcmp(argv[ai], "--loop") == 0) {
+                forever = 1;
+            } else if (argv[ai][0] != '-') {
+                play_sec = atoi(argv[ai]);
+                if (play_sec <= 0)
+                    forever = 1;
+            }
+        }
+
+        int64_t limit = forever ? 0 : (int64_t)play_sec * 1000000ll;
         int fail_show = 0;
         int64_t next_osd = 0;
         int vw = 0, vh = 0;   /* 当前视频的显示宽高（crop 后） */
 
-        while (now_us() - t0 < limit) {
+        if (forever)
+            printf("[player] 无限循环模式（Ctrl-C 退出）\n");
+
+        /* forever 时 limit=0，条件恒成立；否则按时间退出。
+         * 同时检查 ST_EXIT 和信号标志：开机启动的实例被 init 脚本 stop
+         * （发 SIGTERM）时要能干净退出，否则会在 disp 里留下没清理的层。 */
+        while (!(get_state(&c) & ST_EXIT) && !g_sig_quit &&
+               (forever || now_us() - t0 < limit)) {
             VideoPicture *pic = RequestPicture(c.pdec, 0);
             int fd;
             int64_t slp;
@@ -801,6 +906,14 @@ int main(int argc, char **argv)
 
     if (osd_ok)
         osd_deinit(&osd);
+
+    /* 关掉自己占的两层：视频层 ch0/lyr0、OSD 层 ch1/lyr1。
+     * 必须在 close(fd) 之前做，否则句柄关了就没法 ioctl 了。
+     * 不关的话退出后画面会定格在最后一帧，下次启动还会叠加。 */
+    disp_layer_disable(c.disp_fd, DISP_CHANNEL, DISP_VIDEO_LYR);
+    if (osd_ok)
+        disp_layer_disable(c.disp_fd, OSD_CHANNEL, OSD_LAYER);
+
     if (c.disp_fd >= 0) close(c.disp_fd);
     DestroyVideoDecoder(c.pdec);
     mp4_close(c.mp4);

@@ -1,0 +1,93 @@
+#!/bin/sh /etc/rc.common
+# S95player — 开机自动循环播放视频
+#
+# 启动顺序说明：
+#   START=95 排在 S96wifi-auto 之前。播放不需要网络，早点起来能更快出画面。
+#   也不能太早——要等 /dev/disp 和 /dev/cedar_dev 就绪，那是 rcS 早期就初始化好的。
+#
+# 为什么放在单独脚本而不是塞进 S97gopanel：
+#   两者互不相关。播放挂了不该影响 Web 面板，反之亦然。
+#   独立脚本便于单独 start/stop 排查。
+
+START=95
+STOP=20
+
+BIN=/opt/player
+# 默认播放无音轨的版本。
+# 带音轨的 1280x720.mp4 也能用，但播放器目前还没接 AAC 解码，
+# 用带音轨的文件只是多解析一个用不上的 trak，不如直接用 noaudio 版省事。
+# 想换文件改这一行即可。
+MEDIA=${MEDIA:-/opt/media/1280x720.noaudio.mp4}
+PIDFILE=/var/run/player.pid
+LOGFILE=/tmp/player.log
+
+# 播放器进程的 oom_score_adj。
+# 理由同 gopanel：板子内存只有 108MB，播放器开了硬解缓冲后占用不小，
+# 内存紧张时容易被 OOM 杀掉。设 -300 比 gopanel 的 -500 保守一些，
+# 因为 Web 面板的可用性优先级更高。
+OOM_ADJ=-300
+
+start() {
+    [ -x "$BIN" ] || {
+        logger -t player "binary not found: $BIN"
+        return 1
+    }
+
+    pidof player >/dev/null 2>&1 && return 0
+
+    [ -f "$MEDIA" ] || {
+        logger -t player "media not found: $MEDIA"
+        return 1
+    }
+
+    # 清掉上一次可能残留的 disp 层。
+    # 播放器退出时正常会清理，但如果被 kill -9 就不会——
+    # 残留层会让新实例的画面重叠或黑屏。
+    [ -x /opt/dispclean ] && /opt/dispclean >/dev/null 2>&1
+
+    start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- "$MEDIA" --loop
+
+    sleep 2
+
+    if pidof player >/dev/null 2>&1; then
+        pid=$(pidof player)
+        echo $OOM_ADJ > /proc/$pid/oom_score_adj 2>/dev/null
+        logger -t player "started (pid $pid, media $MEDIA, oom_adj $OOM_ADJ)"
+    else
+        logger -t player "FAILED to start, see $LOGFILE"
+        return 1
+    fi
+}
+
+stop() {
+    pidof player >/dev/null 2>&1 || return 0
+
+    # 先 TERM 让它自己清理 disp 层和解码器
+    pid=$(pidof player)
+    [ -n "$pid" ] && kill -TERM $pid 2>/dev/null
+
+    # 给 3 秒优雅退出时间（要还帧、关解码器、清 disp）
+    i=0
+    while [ $i -lt 6 ]; do
+        pidof player >/dev/null 2>&1 || break
+        sleep 0.5
+        i=$((i+1))
+    done
+
+    # 还不走就强杀
+    if pidof player >/dev/null 2>&1; then
+        logger -t player "graceful stop timeout, force killing"
+        killall -9 player 2>/dev/null
+        # 强杀后 disp 层可能残留，清理一下
+        [ -x /opt/dispclean ] && /opt/dispclean >/dev/null 2>&1
+    fi
+
+    rm -f "$PIDFILE"
+    logger -t player "stopped"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}

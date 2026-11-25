@@ -40,6 +40,8 @@
 - **持两帧再还**（`held[2]`）：disp 正在扫当前帧的 dma-buf，立刻 `ReturnPicture` 会撕裂。别改成用完就还。
 - **OSD 画布只有 210×111**：全屏要 7.9MB，板子总共才 108MB。别改大。
 - **内存显示用 `MemAvailable`**：`MemFree` 常年 9MB 是页缓存行为，不是内存不足。别改回 `MemFree`。
+- **退出必须关 disp 层**：`disp_layer_disable()` 用 `DISP_LAYER_SET_CONFIG2` + `enable=0`（不是 `DISP_LAYER_DISABLE`）。不关的话退出后画面定格在最后一帧，下次启动会叠加花屏。**别动 `ch1/lyr0`**，那是系统 fbdev 层，关了黑屏。
+- **信号处理只置标志**：`pthread_mutex_lock` 不是 async-signal-safe，在 handler 里加锁会死锁且无日志。只设 `volatile sig_atomic_t`，主循环自己检查。
 
 ## 环境
 
