@@ -13,7 +13,10 @@ STOP=16
 BIN=/opt/gopanel/gopanel
 DATADIR=/opt/gopanel/data
 PIDFILE=/var/run/gopanel.pid
-PORT=8080
+# 端口用 80，这样局域网直接 http://linuxhost.local/ 就能访问，不用带端口号。
+# gopanel 以 root 运行，绑定特权端口没问题。
+# 如果 80 被其他服务占了，改回 8080 即可（地址变成 http://linuxhost.local:8080/）。
+PORT=80
 
 # ---------------------------------------------------------------------------
 # 为什么需要 OOM 保护
@@ -35,6 +38,22 @@ PORT=8080
 # 取值范围 -1000 ~ 1000，-1000 表示完全豁免（不推荐，真正缺内存时会更糟）。
 OOM_ADJ=-500
 
+# ---------------------------------------------------------------------------
+# mDNS —— 让局域网用 http://linuxhost.local:8080/ 访问
+# ---------------------------------------------------------------------------
+# gopanel 自带 mDNS 广播，但默认关闭，必须显式传 -mdns 才启用。
+# -host 指定广播的主机名，不传的话取系统 hostname（本机是 TinaLinux），
+# 那样广播出去就是 TinaLinux.local，不是我们要的 linuxhost.local。
+#
+# 注意：
+#   1. mDNS 走多播，不需要 DNS 服务器，Windows 10/11、macOS、Linux(avahi)
+#      都原生支持 .local 解析。nslookup 查不到是正常的——它只问 DNS 服务器，
+#      不走多播。要用 ping 或浏览器测。
+#   2. 端口设成 80，所以局域网直接访问 http://linuxhost.local/ 即可，
+#      不用带端口号。见上面的 PORT 说明。
+MDNS_ENABLE=1
+MDNS_HOST=linuxhost
+
 start() {
     [ -x "$BIN" ] || {
         logger -t gopanel "binary not found: $BIN"
@@ -45,12 +64,35 @@ start() {
 
     mkdir -p "$DATADIR"
 
-    # start-stop-daemon -b 让进程彻底脱离当前会话。
-    # 直接 `cmd &` 会在 rcS 脚本退出时被回收，之前的测试踩过这个坑。
-    start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- \
-        -addr ":$PORT" -data "$DATADIR"
+    # 组装启动参数。
+    #
+    # 【不能用 set --】set -- 会覆盖脚本自身的位置参数 $1/$2...，
+    # 而 rc.common 是靠 $1（start/stop/restart）来决定调用哪个函数的。
+    # 【注意冒号】gopanel 的 -addr 要的是 Go 的 "host:port" 格式，
+# 只监听所有地址时必须写成 ":80"（前面带冒号）。
+# 写成 "80" 会报 `listen tcp: address 80: missing port in address`。
+ar_args="-addr :$PORT -data $DATADIR"
 
-    sleep 1
+    if [ "$MDNS_ENABLE" = "1" ]; then
+        ar_args="$ar_args -mdns -host $MDNS_HOST"
+    fi
+
+    # 【关于 start-stop-daemon -b】
+    #
+    # rc.common 最后一行是 `"$action" "$@" &`，已经把 start() 放到后台了。
+    # 叠加 -b 理论上会多一层后台，但实测 -b 反而更可靠：
+    # 不加 -b 时 start-stop-daemon 是前台等待模式，配合 rc.common 的 &
+    # 会出现 pidfile 和实际进程对不上的情况。
+    #
+    # 实测：
+    #   -b + 正确参数  → 进程存活，pidfile 正确
+    #   -b + 错误参数  → start-stop-daemon 仍返回 0 并写 pidfile，但进程立刻退出，
+    #                    pidof 找不到，且没有任何报错（这是排查中最耗时的坑）
+    # 所以 start() 末尾必须用 pidof 二次确认，不能只看 start-stop-daemon 的返回值。
+    # shellcheck disable=SC2086  # 这里就是要按空格拆成多个参数
+    start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- $ar_args
+
+    sleep 2
 
     if pidof gopanel >/dev/null 2>&1; then
         pid=$(pidof gopanel)

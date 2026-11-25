@@ -224,5 +224,135 @@ oom_adj=-500
   cp /opt/gopanel/S97gopanel.bak /etc/init.d/S97gopanel
   ```
 
-- 板子上**没有** `logread` / `head` / `tail` / `sort` / `pgrep`，
+- 板子上**没有** `logread` / `head` / `tail` / `sort` / `pgrep` / `nohup`，
   写脚本时只能用 `grep` / `sed` / `awk` / `cat` / `tr` / `pidof`。
+
+## 八、局域网域名访问 `http://linuxhost.local/`
+
+### 8.1 现象
+
+`http://linuxhost.local/` 访问不了。
+
+### 8.2 三重原因
+
+| 问题 | 实测 |
+|---|---|
+| 没有 mDNS 广播 | 板子上没有 avahi/mdnsd，gopanel 的 `-mdns` 也没启用 |
+| 主机名不匹配 | 系统 hostname 是 `TinaLinux`，不是 `linuxhost` |
+| 没监听 80 端口 | 原来监听 8080，`http://xxx.local/` 默认打到 80 |
+
+### 8.3 gopanel 自带 mDNS，但要显式开启
+
+```bash
+/opt/gopanel/gopanel -h
+```
+
+```
+-host string    mDNS 主机名，默认取系统 hostname
+-mdns           启用 mDNS 广播 (hostname.local)，需要网络允许客户端间多播
+```
+
+原来的启动参数只有 `-addr :8080 -data ...`，没有 `-mdns`。
+
+### 8.4 改法
+
+启动脚本里加两个变量：
+
+```sh
+PORT=80                 # 用 80 就不用带端口号
+MDNS_ENABLE=1
+MDNS_HOST=linuxhost
+```
+
+参数拼接：
+
+```sh
+ar_args="-addr :$PORT -data $DATADIR"
+[ "$MDNS_ENABLE" = "1" ] && ar_args="$ar_args -mdns -host $MDNS_HOST"
+start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- $ar_args
+```
+
+### 8.5 验证结果
+
+```
+$ ping linuxhost.local
+回复自 192.168.3.250: 字节=32 时间=4ms TTL=64
+
+$ curl -o /dev/null -w "%{http_code}" http://linuxhost.local/
+200
+```
+
+### 8.6 注意：`nslookup` 查不到是正常的
+
+```bash
+nslookup linuxhost.local
+# *** Non-existent domain
+```
+
+mDNS 走**多播 UDP 5353**，不经过 DNS 服务器。`nslookup` 只问配置的 DNS 服务器，
+所以永远查不到 `.local`。
+
+要用 `ping`、`curl` 或浏览器来测——这些走系统解析链，Windows 10/11、
+macOS、装有 avahi 的 Linux 都能自动处理 `.local`。
+
+## 九、这一轮踩到的四个坑
+
+### 坑 1：`-addr 80` 少了冒号
+
+```
+gopanel listening on 80
+2026/11/25 11:03:13 listen tcp: address 80: missing port in address
+```
+
+gopanel 的 `-addr` 是 Go 的 `host:port` 格式，监听所有地址必须写 `:80`。
+写成 `80` 会当成主机名解析，报错后进程立即退出。
+
+**这个坑最耗时间**，因为：
+- `start-stop-daemon` 返回 0（成功）
+- pidfile 也正常写了
+- 但进程立刻消失，`pidof` 找不到
+- 没有任何错误输出到终端（被 `-b` 重定向到 /dev/null 了）
+
+只有手动前台执行才看得到那行 `missing port in address`。
+
+**教训**：`start-stop-daemon -b` 启动后必须用 `pidof` 二次确认，
+不能只看它的返回值。
+
+### 坑 2：`set --` 破坏 rc.common 的参数派发
+
+`rc.common` 的逻辑是：
+
+```sh
+initscript=$1
+action=${2:-help}
+shift 2
+...
+"$action" "$@" &
+```
+
+它在最外层取走了 `$1`（脚本路径）和 `$2`（start/stop），然后调用 `start()`。
+
+如果 `start()` 内部用 `set -- -addr ...`，会**覆盖脚本自身的位置参数**。
+虽然此时 `action` 已经存进变量了，但如果 start() 里还要用位置参数，
+就会拿到错的值。
+
+改成普通变量拼接更安全。
+
+### 坑 3：`start-stop-daemon -b` 的静默失败
+
+这和环境无关，是通用行为：`-b` 让进程脱离终端，stdout/stderr 都指向
+/dev/null，**任何启动期错误都会被吞掉**。
+
+排查这类"启动了但没起来"的问题，唯一可靠的办法是手动前台跑一次：
+
+```bash
+/opt/gopanel/gopanel -addr :80 -data /opt/gopanel/data -mdns -host linuxhost
+```
+
+### 坑 4：误以为是 `-b` 和 rc.common 的 `&` 冲突
+
+排查过程中一度认为是"双层后台"导致进程被挂断，改成不带 `-b`。
+实际验证后发现 `-b` 完全正常，真正的错误是坑 1 的冒号。
+
+**教训**：不要基于推理下结论，要实测。当时如果不做那个
+"`-b` 启动 8080 vs 80 对比"的实验，就会一直往错误方向改。
