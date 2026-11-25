@@ -1,0 +1,58 @@
+#!/bin/sh /etc/rc.common
+# gopanel-watchdog 开机自启
+#
+# START=98 排在 S97gopanel 之后 —— 先让 gopanel 正常启动，
+# 看门狗再接管。反过来的话 watchdog 会在 gopanel 起来之前就判它"挂了"，
+# 白白打一条重启日志。
+
+START=98
+STOP=15
+
+WATCHDOG=/opt/gopanel/watchdog.sh
+PIDFILE=/var/run/gopanel-wd.pid
+
+# 判断 watchdog 是否在跑。
+#
+# 不能用 pidof watchdog.sh —— 进程实际是 "/bin/sh /opt/gopanel/watchdog.sh"，
+# pidof 按可执行文件名(comm)匹配，comm 是 "sh" 不是 "watchdog.sh"，
+# 所以永远匹配不到。这里改成扫 /proc/*/cmdline 找完整路径。
+wd_running() {
+    for p in /proc/[0-9]*/cmdline; do
+        [ -r "$p" ] || continue
+        tr '\0' ' ' < "$p" 2>/dev/null | grep -q "watchdog\.sh" && return 0
+    done
+    return 1
+}
+
+start() {
+    [ -x "$WATCHDOG" ] || {
+        logger -t gopanel-wd "watchdog script not found: $WATCHDOG"
+        return 1
+    }
+
+    wd_running && return 0
+
+    start-stop-daemon -S -b -x /bin/sh -m -p "$PIDFILE" -- "$WATCHDOG"
+    sleep 1
+
+    if wd_running; then
+        logger -t gopanel-wd "watchdog started"
+    else
+        logger -t gopanel-wd "FAILED to start watchdog"
+        return 1
+    fi
+}
+
+stop() {
+    wd_running || return 0
+    # 找到 watchdog 的 pid 再杀，避免 killall 误伤其他 sh 进程
+    for p in /proc/[0-9]*/cmdline; do
+        [ -r "$p" ] || continue
+        if tr '\0' ' ' < "$p" 2>/dev/null | grep -q "watchdog\.sh"; then
+            pid=$(echo "$p" | sed 's|/proc/||; s|/cmdline||')
+            kill "$pid" 2>/dev/null
+        fi
+    done
+    rm -f "$PIDFILE"
+    logger -t gopanel-wd "watchdog stopped"
+}

@@ -1,0 +1,93 @@
+#!/bin/sh /etc/rc.common
+# gopanel - BingPi-M2 单文件 Web 管理面板，开机自启
+#
+# 挂载点说明/重要：这个脚本必须命名为 /etc/init.d/S97gopanel。
+# 本构建的 rc.final 遍历的是 /etc/init.d/S??*，不是 /etc/rc.d/。
+#
+# START=97 让它排在 S96wifi-auto 之后 —— 面板要显示 WiFi 状态，
+# 得等网络先起来。
+
+START=97
+STOP=16
+
+BIN=/opt/gopanel/gopanel
+DATADIR=/opt/gopanel/data
+PIDFILE=/var/run/gopanel.pid
+PORT=8080
+
+# ---------------------------------------------------------------------------
+# 为什么需要 OOM 保护
+# ---------------------------------------------------------------------------
+# 这块板子 MemTotal 只有 108MB，长期运行会频繁触发 OOM killer。
+#
+# gopanel 是 Go 程序，启动时会预留很大的虚拟地址空间（实测 total-vm 572MB），
+# 而实际 RSS 只有 3.6MB。但内核的 OOM 评分主要看 total-vm 和 RSS 的综合，
+# 结果它成了 oom_score 最高的进程，每次内存紧张都被优先杀掉。
+#
+# 实测记录（dmesg）：
+#   [38649] adbd invoked oom-killer
+#   [38650] oom-kill: task=gopanel, pid=202
+#   Out of memory: Killed process 202 (gopanel) total-vm:572192kB anon-rss:1892kB
+#
+# 注意触发者是 adbd —— 也就是调试时的 adb 命令（pull 大文件等）把内存压垮了。
+#
+# 处理办法：把 oom_score_adj 调到 -500，显著降低被杀概率。
+# 取值范围 -1000 ~ 1000，-1000 表示完全豁免（不推荐，真正缺内存时会更糟）。
+OOM_ADJ=-500
+
+start() {
+    [ -x "$BIN" ] || {
+        logger -t gopanel "binary not found: $BIN"
+        return 1
+    }
+
+    pidof gopanel >/dev/null 2>&1 && return 0
+
+    mkdir -p "$DATADIR"
+
+    # start-stop-daemon -b 让进程彻底脱离当前会话。
+    # 直接 `cmd &` 会在 rcS 脚本退出时被回收，之前的测试踩过这个坑。
+    start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- \
+        -addr ":$PORT" -data "$DATADIR"
+
+    sleep 1
+
+    if pidof gopanel >/dev/null 2>&1; then
+        pid=$(pidof gopanel)
+        # 降低被 OOM 杀掉的概率。写失败不影响启动，只是没这层保护。
+        echo $OOM_ADJ > /proc/$pid/oom_score_adj 2>/dev/null
+        logger -t gopanel "started on port $PORT (pid $pid, oom_adj $OOM_ADJ)"
+    else
+        logger -t gopanel "FAILED to start"
+        return 1
+    fi
+}
+
+stop() {
+    # 先杀 watchdog，否则它会在我们杀完 gopanel 后立刻又拉起来
+    [ -x /etc/init.d/S98gopanel-watchdog ] && \
+        /etc/init.d/S98gopanel-watchdog stop 2>/dev/null
+
+    pidof gopanel >/dev/null 2>&1 || return 0
+
+    # start-stop-daemon -K 的 -x 要指向实际的可执行文件路径，
+    # 之前用的 $BIN 没问题，但进程可能是被 start-stop-daemon -b 起的，
+    # pidfile 不一定可靠，所以 killall 兜底。
+    start-stop-daemon -K -p "$PIDFILE" 2>/dev/null
+    sleep 1
+    killall gopanel 2>/dev/null
+    sleep 1
+    killall -9 gopanel 2>/dev/null
+
+    rm -f "$PIDFILE"
+    logger -t gopanel "stopped"
+}
+
+# 供 watchdog 调用：只检查并在挂了时重启，不做别的
+ensure() {
+    if pidof gopanel >/dev/null 2>&1; then
+        return 0
+    fi
+    logger -t gopanel "not running, restarting"
+    start
+}
