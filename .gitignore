@@ -1,0 +1,35 @@
+# 编译产物
+*.o
+player
+tools/dispclean
+tools/fdverify
+tools/dumppic
+tools/tscheck
+tools/osddump
+tools/pixcheck
+tools/ofcheck
+tools/fdprobe
+
+# 厂商预编译库（版权物，从设备 pull 得到，不进仓库）
+lib/
+*.so
+
+# SDK 头文件副本（体积大，由用户自己解压 SDK）
+sdk/
+
+# 工具链
+toolchain/
+
+# 临时与调试文件
+*.ppm
+*.png
+*.yuv
+*.log
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
