@@ -27,3 +27,8 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+# 临时编译的测试产物（放根目录，别进仓库）
+/alsaprobe
+/alsatest
+/audiotest
+/szarm

@@ -81,7 +81,7 @@ RELDIR   := release
 # ---------------------------------------------------------------------------
 
 TARGET  := $(RELDIR)/player
-SRCS    := src/player.c src/mp4parse.c src/avcc2annexb.c src/osd.c
+SRCS    := src/player.c src/mp4parse.c src/avcc2annexb.c src/osd.c src/alsa_out.c
 # 镜像源码结构：src/foo.c -> build/foo.o
 OBJS    := $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRCS))
 DEPS    := $(OBJS:.o=.d)
@@ -97,6 +97,11 @@ TOOL_SRCS  := $(addprefix tools/,$(addsuffix .c,$(TOOL_NAMES)))
 TOOL_OBJS  := $(patsubst tools/%.c,$(BUILDDIR)/tools/%.o,$(TOOL_SRCS))
 TOOL_BINS  := $(addprefix $(RELDIR)/tools/,$(TOOL_NAMES))
 TOOL_DEPS  := $(TOOL_OBJS:.o=.d)
+
+# 音频诊断工具。只依赖 alsa_out.c，不碰解码器，
+# 所以单独列出来——这样即使 vdecoder 相关头文件缺失也能单独编译它。
+AUDIO_TOOLS := audiotest
+AUDIO_BINS  := $(addprefix $(RELDIR)/tools/,$(AUDIO_TOOLS))
 
 # ---------------------------------------------------------------------------
 # 规则
@@ -142,8 +147,20 @@ $(RELDIR)/tools/%: $(BUILDDIR)/tools/%.o $(SHARED_OBJS) | $(RELDIR)/tools
 	@$(STRIP) $@ 2>/dev/null || true
 	@echo "  built $@"
 
-tools: check-env $(TOOL_BINS)
-	@echo "--- $(words $(TOOL_BINS)) 个诊断工具已生成到 $(RELDIR)/tools/ ---"
+tools: check-env $(TOOL_BINS) $(AUDIO_BINS)
+	@echo "--- $(words $(TOOL_BINS) $(AUDIO_BINS)) 个诊断工具已生成到 $(RELDIR)/tools/ ---"
+
+# 音频工具只需 alsa_out.c，单独链接，不依赖厂商解码库
+$(RELDIR)/tools/audiotest: $(BUILDDIR)/tools/audiotest.o $(BUILDDIR)/alsa_out.o | $(RELDIR)/tools
+	$(CC) $(CFLAGS) -o $@ $^ -lm -lpthread
+	@$(STRIP) $@ 2>/dev/null || true
+	@echo "  built $@"
+
+# 板上的音频通路测试脚本（纯 shell，不需要编译）
+install-scripts:
+	adb push tools/probe_audio.sh /tmp/probe_audio.sh
+	adb shell "sed -i 's/\r$$//' /tmp/probe_audio.sh; chmod +x /tmp/probe_audio.sh"
+	@echo "已部署到 /tmp/probe_audio.sh"
 
 # 从板子上拉取链接用的库。
 # 必须用板上真实的 .so：头文件和库版本对不上会导致结构体错位，
