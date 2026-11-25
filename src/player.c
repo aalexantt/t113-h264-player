@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 
 #include "vdecoder.h"
 #include "memoryAdapter.h"
@@ -571,6 +572,84 @@ static void *decoder_thread(void *arg)
 
 /* ---------- disp 层清理 ---------- */
 
+/* 清空 fb0 显存，抹掉开机 LOGO 残留。
+ *
+ * 【要解决的现象】
+ * 开机后视频正常播放，但屏幕中央有一块黑底彩色文字的方框盖在视频上，
+ * 四周画面是好的。那是 u-boot 打的 LOGO。
+ *
+ * 【为什么清掉 fb0 就能解决】
+ * 内核启动时会 "Freeing logo buffer memory"，但那只是释放了内存，
+ * fb0（ch1/lyr0）这一层的显存内容并没有被清 —— LOGO 还留在里面。
+ *
+ * 关键点是 fb0 层用的是逐像素 alpha（sys 里显示 a[pixel 255]），
+ * 所以 LOGO 的像素是不透明的，会盖在视频层上面
+ * （视频在 ch0/lyr0，zorder 20 > fb0 的 16，但 alpha 让 fb0 透出来）。
+ *
+ * 把 fb0 整个写成 0 字节 = BGRA 全透明，这一层就什么都不显示，
+ * 视频完整露出。
+ *
+ * 【为什么用 mmap 而不是 write】
+ * write() 在 fbdev 上会走 console 的 scroll 逻辑，慢且可能只清一部分。
+ * mmap 后 memset 是直接改显存，一次到位。
+ *
+ * 【为什么放在 disp 初始化之后】
+ * 要保证 disp 已经把 fb0 层挂上了，清的内容才不会在后续初始化里被覆盖。
+ * 实际上驱动不会主动重画 fb0，但放在 disp_init 之后语义更清楚。 */
+static void fb_clear_alpha(void)
+{
+    const char *dev = "/dev/fb0";
+    int fd, w = 0, h = 0, bpp = 0;
+    size_t bytes;
+    void *map;
+    FILE *f;
+
+    /* 分辨率从 sysfs 读，别写死 1920x1080 —— 换屏就不用改代码 */
+    f = fopen("/sys/class/graphics/fb0/virtual_size", "r");
+    if (!f)
+        return;
+    if (fscanf(f, "%d,%d", &w, &h) != 2) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+
+    f = fopen("/sys/class/graphics/fb0/bits_per_pixel", "r");
+    if (f) {
+        if (fscanf(f, "%d", &bpp) != 1)
+            bpp = 32;
+        fclose(f);
+    } else {
+        bpp = 32;
+    }
+
+    if (w <= 0 || h <= 0 || bpp <= 0)
+        return;
+
+    bytes = (size_t)w * (size_t)h * (size_t)(bpp / 8);
+
+    fd = open(dev, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "[player] 打开 %s 失败，跳过清屏: %s\n",
+                dev, strerror(errno));
+        return;
+    }
+
+    map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        fprintf(stderr, "[player] mmap fb0 失败，跳过清屏: %s\n",
+                strerror(errno));
+        close(fd);
+        return;
+    }
+
+    memset(map, 0, bytes);
+    munmap(map, bytes);
+    close(fd);
+
+    printf("[player] 已清空 fb0 开机 LOGO 残留 (%dx%d/%dbpp)\n", w, h, bpp);
+}
+
 /* 关闭指定的 disp 层。
  *
  * 【为什么必须做】
@@ -581,8 +660,8 @@ static void *decoder_thread(void *arg)
  *
  * 【为什么用 SET_CONFIG2 而不是 DISP_LAYER_DISABLE】
  * 驱动头里虽然有 DISP_LAYER_DISABLE(0x41)，但本驱动版本实际走的是
- * DISP_LAYER_SET_CONFIG2 + enable=0 这条路径（dispclean 也是这么做的，
- * 实测有效）。0x41 那个 ioctl 在本版本上不生效。
+ * DISP_LAYER_SET_CONFIG2 + enable=0 这条路径（实测有效，
+ * 0x41 那个 ioctl 在本版本上不生效）。
  *
  * 注意：只关自己用到的层，别去动 ch1/lyr0（系统 fbdev 层），
  * 那层关了会直接黑屏。 */
@@ -714,6 +793,12 @@ int main(int argc, char **argv)
     /* 3. disp */
     if (disp_init(&c) != 0)
         fprintf(stderr, "[player] disp 初始化失败，只做解码不出画面\n");
+
+    /* 3.1 清掉 fb0 里残留的开机 LOGO。
+     * 放在 disp 初始化之后、开始送帧之前 —— 这时 fb0 层已经挂好，
+     * 清完立刻会有视频帧盖上来，中间不会出现黑屏空窗。 */
+    if (c.disp_fd >= 0)
+        fb_clear_alpha();
 
     /* 3.5 OSD 层（放在 UI 通道，逐像素 alpha 混合） */
     if (c.disp_fd >= 0) {

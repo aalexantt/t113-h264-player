@@ -40,14 +40,14 @@ start() {
         return 1
     }
 
-    # 清掉上一次可能残留的 disp 层。
-    # 播放器退出时正常会清理，但如果被 kill -9 就不会——
-    # 残留层会让新实例的画面重叠或黑屏。
-    [ -x /opt/dispclean ] && /opt/dispclean >/dev/null 2>&1
-
     start-stop-daemon -S -b -x "$BIN" -m -p "$PIDFILE" -- "$MEDIA" --loop
 
     sleep 2
+
+    # 注：开机 LOGO 残留的清理已经移到播放器内部
+    # （player.c 的 fb_clear_alpha()，在 disp 初始化之后调用）。
+    # 放播放器里的好处是：手动跑 ./player 也能清，不依赖这个脚本；
+    # 而且清完立刻就有视频帧盖上来，中间没有黑屏空窗。
 
     if pidof player >/dev/null 2>&1; then
         pid=$(pidof player)
@@ -60,26 +60,30 @@ start() {
 }
 
 stop() {
-    pidof player >/dev/null 2>&1 || return 0
-
-    # 先 TERM 让它自己清理 disp 层和解码器
-    pid=$(pidof player)
-    [ -n "$pid" ] && kill -TERM $pid 2>/dev/null
-
-    # 给 3 秒优雅退出时间（要还帧、关解码器、清 disp）
-    i=0
-    while [ $i -lt 6 ]; do
-        pidof player >/dev/null 2>&1 || break
-        sleep 0.5
-        i=$((i+1))
-    done
-
-    # 还不走就强杀
+    # 注意：不能写 `pidof player || return 0`。
+    # 那样进程本来就没跑时不会走到下面的 rm -f "$PIDFILE"，
+    # pidfile 会残留，下次 start 时 start-stop-daemon 可能误判。
     if pidof player >/dev/null 2>&1; then
-        logger -t player "graceful stop timeout, force killing"
-        killall -9 player 2>/dev/null
-        # 强杀后 disp 层可能残留，清理一下
-        [ -x /opt/dispclean ] && /opt/dispclean >/dev/null 2>&1
+        # 先 TERM 让它自己清理 disp 层和解码器
+        pid=$(pidof player)
+        [ -n "$pid" ] && kill -TERM $pid 2>/dev/null
+
+        # 给 3 秒优雅退出时间（要还帧、关解码器、清 disp）
+        i=0
+        while [ $i -lt 6 ]; do
+            pidof player >/dev/null 2>&1 || break
+            sleep 0.5
+            i=$((i+1))
+        done
+
+        # 还不走就强杀。
+        # 强杀后播放器来不及关 disp 层，但下次启动时会重新配置同一组层
+        # （ch0/lyr0、ch1/lyr1），覆盖掉旧状态，不需要额外清理。
+        if pidof player >/dev/null 2>&1; then
+            logger -t player "graceful stop timeout, force killing"
+            killall -9 player 2>/dev/null
+            sleep 1
+        fi
     fi
 
     rm -f "$PIDFILE"

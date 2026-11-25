@@ -92,7 +92,7 @@ SHARED_OBJS := $(BUILDDIR)/mp4parse.o $(BUILDDIR)/avcc2annexb.o
 # 诊断工具。这些工具共用 mp4parse/avcc2annexb 和同一组链接库，
 # 统一按同一套依赖链接，省得每个工具单独维护依赖列表
 # （多链进去的 .o 若没被引用，链接器会自动丢弃，无副作用）。
-TOOL_NAMES := dispclean fdverify dumppic tscheck osddump
+TOOL_NAMES := fdverify dumppic tscheck osddump dcol fbclear
 TOOL_SRCS  := $(addprefix tools/,$(addsuffix .c,$(TOOL_NAMES)))
 TOOL_OBJS  := $(patsubst tools/%.c,$(BUILDDIR)/tools/%.o,$(TOOL_SRCS))
 TOOL_BINS  := $(addprefix $(RELDIR)/tools/,$(TOOL_NAMES))

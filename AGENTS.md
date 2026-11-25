@@ -35,13 +35,19 @@
 
 第 3 步能区分「解码问题」还是「显示问题」，别跳过。
 
-## 三个容易被误改的细节
+## 容易被误改的细节
 
 - **持两帧再还**（`held[2]`）：disp 正在扫当前帧的 dma-buf，立刻 `ReturnPicture` 会撕裂。别改成用完就还。
 - **OSD 画布只有 210×111**：全屏要 7.9MB，板子总共才 108MB。别改大。
 - **内存显示用 `MemAvailable`**：`MemFree` 常年 9MB 是页缓存行为，不是内存不足。别改回 `MemFree`。
 - **退出必须关 disp 层**：`disp_layer_disable()` 用 `DISP_LAYER_SET_CONFIG2` + `enable=0`（不是 `DISP_LAYER_DISABLE`）。不关的话退出后画面定格在最后一帧，下次启动会叠加花屏。**别动 `ch1/lyr0`**，那是系统 fbdev 层，关了黑屏。
 - **信号处理只置标志**：`pthread_mutex_lock` 不是 async-signal-safe，在 handler 里加锁会死锁且无日志。只设 `volatile sig_atomic_t`，主循环自己检查。
+- **必须清 fb0**：`fb_clear_alpha()` 不能去掉。u-boot 的 LOGO 留在 fb0 显存里，而 fb0 层是逐像素 alpha，LOGO 像素不透明会盖在视频上（表现为屏幕中央一个黑底方框、四周视频正常）。清成 BGRA 全 0（透明）即可。
+- **视频必须走 ch0**：ch0 是 VI 通道，支持 YUV；ch1/2/3 是 UI 通道，只认 RGB。把 NV12 喂给 ch1 会得到紫绿乱码 + 左右重复画面（像素按 RGB 重排）。
+
+## 不要被 err 计数误导
+
+`/sys/class/disp/disp/attr/sys` 里的 `err` 字段在只有 ch0 有图层时每帧都会涨（约 60/秒），**这是 DE 的无害统计，不代表图层失败**。曾经据此误判"ch0 通道损坏"，实际视频显示完全正常。判断显示是否正常，只看屏幕实际画面。
 
 ## 环境
 
