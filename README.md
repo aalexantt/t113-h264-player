@@ -71,6 +71,34 @@ make TC=/opt/toolchain-sunxi-musl/toolchain/bin \
      SDK=/opt/Tina-Linux
 ```
 
+产物布局：
+
+```
+build/          所有中间文件（.o / .d），按源码目录结构镜像
+  ├── player.o
+  ├── mp4parse.o
+  └── tools/
+      └── dispclean.o
+release/        最终可执行文件（已 strip）
+  ├── player
+  └── tools/
+      ├── dispclean
+      └── ...
+```
+
+- 中间文件和产物分离，源码目录保持干净
+- 带头文件依赖跟踪（`-MMD -MP`），改了 `src/osd.h` 只会重编引用它的文件
+- 链接后自动 strip（50K → 25K）
+
+其他目标：
+
+```bash
+make tools      # 编译诊断工具到 release/tools/
+make clean      # 清掉 build/ 和 release/
+make deploy     # 推送到板子 /opt
+make pull-libs  # 从板子拉链接用的 .so
+```
+
 ### 3. 部署运行
 
 ```bash

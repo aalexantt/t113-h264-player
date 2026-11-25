@@ -1,14 +1,8 @@
 # 编译产物
+build/
+release/
 *.o
-player
-tools/dispclean
-tools/fdverify
-tools/dumppic
-tools/tscheck
-tools/osddump
-tools/pixcheck
-tools/ofcheck
-tools/fdprobe
+*.d
 
 # 厂商预编译库（版权物，从设备 pull 得到，不进仓库）
 lib/
